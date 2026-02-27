@@ -3,7 +3,7 @@ File: reporting.py
 Author: Matthew Allen
 
 Description:
-    Misc. functions to log a dictionary of metrics to wandb and print them to the console.
+    Misc. functions to log a dictionary of metrics to logger and print them to the console.
 """
 
 
@@ -46,33 +46,9 @@ def _form_printable_groups(report):
 
     return groups
 
-def report_metrics(loggable_metrics, debug_metrics, wandb_run=None):
-    """
-    Function to report a dictionary of metrics to the console and wandb.
-    :param loggable_metrics: Dictionary containing all the data to be logged.
-    :param debug_metrics: Optional dictionary containing extra data to be printed to the console for debugging.
-    :param wandb_run: Wandb run to log to.
-    :return: None.
-    """
-
-    if wandb_run is not None:
-        wandb_run.log(loggable_metrics)
-
-    # Print debug data first.
-    if debug_metrics is not None:
-        print("\nBEGIN DEBUG\n")
-        print(dump_dict_to_debug_string(debug_metrics))
-        print("\nEND DEBUG\n")
-
-
-    # Print the loggable metrics in a desirable format to the console.
-    print("{}{}{}".format("-"*8, "BEGIN ITERATION REPORT", "-"*8))
-    groups = _form_printable_groups(loggable_metrics)
-    out = ""
-    for group in groups:
-        out += dump_dict_to_debug_string(group) + "\n"
-    print(out[:-2])
-    print("{}{}{}\n\n".format("-"*8, "END ITERATION REPORT", "-"*8))
+def report_metrics(loggable_metrics, debug_metrics, logger=None):
+    if logger is not None:
+        logger.log(loggable_metrics)
 
 def dump_dict_to_debug_string(dictionary):
     """

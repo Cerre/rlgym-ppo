@@ -5,7 +5,7 @@ Author: Matthew Allen
 Description:
 The primary algorithm file. The Learner object coordinates timesteps from the workers 
 and sends them to PPO, keeps track of the misc. variables and statistics for logging,
-reports to wandb and the console, and handles checkpointing.
+reports to logger and the console, and handles checkpointing.
 """
 
 import json
@@ -17,8 +17,7 @@ from typing import Union, Tuple
 
 import numpy as np
 import torch
-import wandb
-from wandb.wandb_run import Run
+from tqdm import tqdm
 
 from rlgym_ppo.batched_agents import BatchedAgentManager
 from rlgym_ppo.ppo import ExperienceBuffer, PPOLearner
@@ -59,12 +58,7 @@ class Learner(object):
             policy_lr: float = 3e-4,
             critic_lr: float = 3e-4,
 
-            log_to_wandb: bool = False,
-            load_wandb: bool = True,
-            wandb_run: Union[Run, None] = None,
-            wandb_project_name: Union[str, None] = None,
-            wandb_group_name: Union[str, None] = None,
-            wandb_run_name: Union[str, None] = None,
+            logger=None,
 
             checkpoints_save_folder: Union[str, None] = None,
             add_unix_timestamp: bool = True,
@@ -188,18 +182,9 @@ class Learner(object):
             "shm_buffer_size": shm_buffer_size,
         }
 
-        self.wandb_run = wandb_run
-        wandb_loaded = checkpoint_load_folder is not None and self.load(checkpoint_load_folder, load_wandb, policy_lr, critic_lr)
-
-        if log_to_wandb and self.wandb_run is None and not wandb_loaded:
-            project = "rlgym-ppo" if wandb_project_name is None else wandb_project_name
-            group = "unnamed-runs" if wandb_group_name is None else wandb_group_name
-            run_name = "rlgym-ppo-run" if wandb_run_name is None else wandb_run_name
-            print("Attempting to create new wandb run...")
-            self.wandb_run = wandb.init(
-                project=project, group=group, config=self.config, name=run_name, reinit=True
-            )
-            print("Created new wandb run!", self.wandb_run.id)
+        self.logger = logger
+        if checkpoint_load_folder is not None:
+            self.load(checkpoint_load_folder, policy_lr, critic_lr)
         print("Learner successfully initialized!")
 
     def update_learning_rate(self, new_policy_lr=None, new_critic_lr=None):
@@ -245,7 +230,15 @@ class Learner(object):
 
         # Class to watch for keyboard hits
         kb = KBHit()
-        print("Press (p) to pause (c) to checkpoint, (q) to checkpoint and quit (after next iteration)\n")
+        tqdm.write("Press (p) to pause (c) to checkpoint, (q) to checkpoint and quit (after next iteration)\n")
+
+        pbar = tqdm(
+            total=self.timestep_limit,
+            initial=self.agent.cumulative_timesteps,
+            unit=" ts",
+            unit_scale=True,
+            dynamic_ncols=True,
+        )
 
         # While the number of timesteps we have collected so far is less than the
         # amount we are allowed to collect.
@@ -259,7 +252,7 @@ class Learner(object):
             )
 
             if self.metrics_logger is not None:
-                self.metrics_logger.report_metrics(collected_metrics, self.wandb_run, self.agent.cumulative_timesteps)
+                self.metrics_logger.report_metrics(collected_metrics, self.logger, self.agent.cumulative_timesteps)
 
             # Add the new experience to our buffer and compute the various
             # reinforcement learning quantities we need to
@@ -290,10 +283,16 @@ class Learner(object):
             else:
                 report["Policy Reward"] = np.nan
 
-            # Log to wandb and print to the console.
+            # Log metrics and print to the console.
             reporting.report_metrics(loggable_metrics=report,
                                      debug_metrics=None,
-                                     wandb_run=self.wandb_run)
+                                     logger=self.logger)
+
+            pbar.update(steps_collected)
+            pbar.set_postfix(
+                SPS=f"{steps_collected / collection_time:.0f}",
+                reward=f"{self.agent.average_reward:.4f}" if self.agent.average_reward is not None else "N/A",
+            )
 
             report.clear()
             ppo_report.clear()
@@ -309,16 +308,17 @@ class Learner(object):
             if kb.kbhit():
                 c = kb.getch()
                 if c == 'p':  # pause
-                    print("Paused, press any key to resume")
+                    tqdm.write("Paused, press any key to resume")
                     while True:
                         if kb.kbhit():
                             break
                 if c in ('c', 'q'):
                     self.save(self.agent.cumulative_timesteps)
                 if c == 'q':
+                    pbar.close()
                     return
                 if c in ('c', 'p'):
-                    print("Resuming...\n")
+                    tqdm.write("Resuming...\n")
 
             # Save if we've reached the next checkpoint timestep.
             if self.ts_since_last_save >= self.save_every_ts:
@@ -326,6 +326,8 @@ class Learner(object):
                 self.ts_since_last_save = 0
 
             self.epoch += 1
+
+        pbar.close()
 
     @torch.no_grad()
     def add_new_experience(self, experience):
@@ -400,7 +402,6 @@ class Learner(object):
 
         # Check to see if we've run out of checkpoint space and remove the oldest
         # checkpoints
-        print(f"Saving checkpoint {cumulative_timesteps}...")
         existing_checkpoints = [
             int(arg) for arg in os.listdir(self.checkpoints_save_folder)
         ]
@@ -430,26 +431,16 @@ class Learner(object):
         if self.standardize_returns:
             book_keeping_vars["reward_running_stats"] = self.return_stats.to_json()
 
-        if self.wandb_run is not None:
-            book_keeping_vars["wandb_run_id"] = self.wandb_run.id
-            book_keeping_vars["wandb_project"] = self.wandb_run.project
-            book_keeping_vars["wandb_entity"] = self.wandb_run.entity
-            book_keeping_vars["wandb_group"] = self.wandb_run.group
-            book_keeping_vars["wandb_config"] = self.wandb_run.config.as_dict()
-
         book_keeping_table_path = os.path.join(folder_path, "BOOK_KEEPING_VARS.json")
         with open(book_keeping_table_path, "w") as f:
             json.dump(book_keeping_vars, f, indent=4)
 
-        print(f"Checkpoint {cumulative_timesteps} saved!\n")
 
-    def load(self, folder_path, load_wandb, new_policy_lr=None, new_critic_lr=None):
+    def load(self, folder_path, new_policy_lr=None, new_critic_lr=None):
         """
         Function to load the learning algorithm from a checkpoint.
 
         :param folder_path: Path to the checkpoint folder that will be loaded.
-        :param load_wandb: Whether to resume an existing weights and biases run that
-        was saved with the checkpoint being loaded.
         :return: None
         """
 
@@ -523,7 +514,6 @@ class Learner(object):
         # Load stuff.
         self.ppo_learner.load_from(folder_path)
 
-        wandb_loaded = False
         with open(os.path.join(folder_path, "BOOK_KEEPING_VARS.json"), "r") as f:
             book_keeping_vars = dict(json.load(f))
             self.agent.cumulative_timesteps = book_keeping_vars["cumulative_timesteps"]
@@ -540,28 +530,12 @@ class Learner(object):
                 self.return_stats.from_json(book_keeping_vars["reward_running_stats"])
 
             self.epoch = book_keeping_vars["epoch"]
-            
+
             # Update learning rates if new values are provided
             if new_policy_lr is not None or new_critic_lr is not None:
                 self.update_learning_rate(new_policy_lr, new_critic_lr)
 
-            # check here for backwards compatibility
-
-            if "wandb_run_id" in book_keeping_vars and load_wandb:
-                self.wandb_run = wandb.init(
-                    settings=wandb.Settings(start_method="spawn"),
-                    entity=book_keeping_vars["wandb_entity"],
-                    project=book_keeping_vars["wandb_project"],
-                    group=book_keeping_vars["wandb_group"],
-                    id=book_keeping_vars["wandb_run_id"],
-                    config=book_keeping_vars["wandb_config"],
-                    resume="allow",
-                    reinit=True,
-                )
-                wandb_loaded = True
-
         print("Checkpoint loaded!")
-        return wandb_loaded
 
     def cleanup(self):
         """
@@ -569,8 +543,8 @@ class Learner(object):
         :return: None.
         """
 
-        if self.wandb_run is not None:
-            self.wandb_run.finish()
+        if self.logger is not None:
+            self.logger.finish()
         if type(self.agent) == BatchedAgentManager:
             self.agent.cleanup()
         self.experience_buffer.clear()
